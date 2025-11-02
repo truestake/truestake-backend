@@ -1,5 +1,16 @@
 FROM python:3.11-slim
+
 WORKDIR /app
-RUN python -m pip install --no-cache-dir uvicorn fastapi
+
+# Устанавливаем зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем весь код
+COPY . .
+
 EXPOSE 9000
-CMD ["bash","-lc","python - << 'PY'\nfrom fastapi import FastAPI\napp=FastAPI()\n@app.get('/')\nasync def root():\n    return {'status':'ok','service':'backend'}\nimport uvicorn; uvicorn.run(app, host='0.0.0.0', port=9000)\nPY"]
+ENV PYTHONUNBUFFERED=1
+
+# Запуск Flask backend
+CMD ["python", "-m", "app"]
