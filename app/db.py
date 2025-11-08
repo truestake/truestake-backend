@@ -5,7 +5,6 @@ from sqlalchemy import (
     create_engine,
     Column,
     Integer,
-    BigInteger,
     String,
     Text,
     Float,
@@ -17,18 +16,18 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 def get_postgres_url() -> str:
     """
-    Строим строку подключения к Postgres из переменных окружения.
-    Использует те же значения, что заданы в /opt/truestake/.env.
+    Строка подключения к Postgres.
+    Синхронизировано с /opt/truestake/.env и docker-compose.yml.
     """
     url = os.getenv("POSTGRES_URL")
     if url:
         return url
 
     user = os.getenv("POSTGRES_USER", "truestake")
-    password = os.getenv("POSTGRES_PASSWORD", "truestake_pwd")
+    password = os.getenv("POSTGRES_PASSWORD", "truestake_pass")
     host = os.getenv("POSTGRES_HOST", "postgres")
     port = os.getenv("POSTGRES_PORT", "5432")
-    name = os.getenv("POSTGRES_DB", "truestake")
+    name = os.getenv("POSTGRES_DB", "truestake_db")
 
     return f"postgresql://{user}:{password}@{host}:{port}/{name}"
 
@@ -43,32 +42,19 @@ Base = declarative_base()
 
 class User(Base):
     """
-    Пользователь TrueStake, привязан к Telegram.
-    Используем telegram_id как основной идентификатор.
+    Модель под существующую таблицу users:
+    id, username, telegram_id
     """
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-
-    username = Column(String(64), nullable=True)
-    first_name = Column(String(128), nullable=True)
-    last_name = Column(String(128), nullable=True)
-    language_code = Column(String(8), nullable=True)
-    is_premium = Column(String(8), nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(64), unique=True, index=True, nullable=True)
+    telegram_id = Column(Integer, unique=True, index=True, nullable=True)
 
 
 class Market(Base):
     """
-    Черновая модель рынка. Сейчас не трогаем логику,
-    только сохраняем как есть, чтобы не ломать.
+    Черновая модель рынка — трогать не будем.
     """
     __tablename__ = "markets"
 
@@ -82,12 +68,9 @@ class Market(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-# ---------- INIT ----------
-
 def init_db():
     """
-    Создаём таблицы, если их ещё нет.
-    Вызывается из app.__init__.py один раз при старте.
+    Создаёт таблицы, если их нет. Ничего не дропает.
     """
     try:
         Base.metadata.create_all(bind=engine)
