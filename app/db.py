@@ -6,8 +6,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 POSTGRES_URL = os.getenv(
     "POSTGRES_URL",
-    "postgresql://truestake:truestake_pwd@postgres:5432/truestake",
+    "postgresql://truestake:truestake_pass@postgres:5432/truestake_db",
 )
+
 
 engine = create_engine(POSTGRES_URL, future=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
