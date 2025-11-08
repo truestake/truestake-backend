@@ -19,14 +19,14 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 
 def _validate_init_data(init_data: str, max_age: int = 600):
     """
-    Валидация initData по официальным правилам Telegram WebApp.
+    Валидация initData по правилам Telegram WebApp.
     https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
     """
 
     if not init_data or not BOT_TOKEN:
         return None
 
-    # Разбор query-string в словарь
+    # Разбор query-string initData -> dict
     parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
     data = dict(parsed)
 
@@ -34,7 +34,7 @@ def _validate_init_data(init_data: str, max_age: int = 600):
     if not their_hash:
         return None
 
-    # Контроль времени жизни auth_date
+    # Контроль времени жизни auth_date (можно ослабить при необходимости)
     auth_date_raw = data.get("auth_date")
     if auth_date_raw:
         try:
@@ -44,7 +44,7 @@ def _validate_init_data(init_data: str, max_age: int = 600):
         except ValueError:
             return None
 
-    # Собираем строки key=value, сортируем по ключу
+    # Формируем строку для подписи
     data_check_arr = [f"{k}={v}" for k, v in sorted(data.items())]
     data_check_string = "\n".join(data_check_arr)
 
@@ -64,7 +64,7 @@ def _validate_init_data(init_data: str, max_age: int = 600):
     if not hmac.compare_digest(expected_hash, their_hash):
         return None
 
-    # user — это JSON-строка
+    # user — JSON-строка
     user_raw = data.get("user")
     if not user_raw:
         return None
@@ -81,12 +81,9 @@ def _validate_init_data(init_data: str, max_age: int = 600):
 def auth_telegram():
     """
     Вход:  { "init_data": "<Telegram.WebApp.initData>" }
-    Выход при успехе:
-    {
-        "ok": true,
-        "user": {...},
-        "token": "<jwt>"
-    }
+    Успех: { "ok": true, "user": {...}, "token": "<jwt>" }
+    Ошибка подписи: 401 invalid_init_data
+    Ошибка БД: 500 db_error (+ лог в stdout контейнера)
     """
     body = request.get_json(silent=True) or {}
     init_data = body.get("init_data") or body.get("initData") or ""
@@ -95,7 +92,6 @@ def auth_telegram():
     if not user:
         return jsonify({"ok": False, "error": "invalid_init_data"}), 401
 
-    # --- upsert пользователя в БД ---
     session = SessionLocal()
     try:
         db_user = session.query(User).filter_by(telegram_id=user["id"]).first()
@@ -109,18 +105,20 @@ def auth_telegram():
         db_user.language_code = user.get("language_code")
         db_user.is_premium = str(user.get("is_premium"))
 
-        db_user.updated_at = datetime.utcnow()
+        now = datetime.utcnow()
         if not db_user.created_at:
-            db_user.created_at = datetime.utcnow()
+            db_user.created_at = now
+        db_user.updated_at = now
 
         session.commit()
-    except Exception:
+    except Exception as e:
         session.rollback()
+        # Критично: печатаем ошибку, чтобы видеть её в docker logs
+        print("[auth_telegram][db_error]", repr(e), flush=True)
         return jsonify({"ok": False, "error": "db_error"}), 500
     finally:
         session.close()
 
-    # --- JWT для фронта ---
     token = jwt.encode(
         {
             "sub": str(user["id"]),
