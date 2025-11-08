@@ -12,3 +12,6 @@ app.register_blueprint(ton_bp)
 
 from .telegram_auth import bp as tg_auth_bp
 app.register_blueprint(tg_auth_bp)
+
+from .db import init_db
+init_db()
