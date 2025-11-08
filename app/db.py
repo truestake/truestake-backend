@@ -1,11 +1,9 @@
 import os
-
-from sqlalchemy import create_engine, Column, Integer, String
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, Text, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# URL до PostgreSQL
-# В Docker у нас хост postgres (из docker-compose)
-# Локально можешь переопределить через переменную окружения POSTGRES_URL
+
 POSTGRES_URL = os.getenv(
     "POSTGRES_URL",
     "postgresql://truestake:truestake_pwd@postgres:5432/truestake",
@@ -25,11 +23,20 @@ class User(Base):
     telegram_id = Column(Integer, unique=True, index=True, nullable=True)
 
 
+class Market(Base):
+    __tablename__ = "markets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(String(32), default="open", index=True)
+    outcome_yes_price = Column(Float, default=0.5)
+    outcome_no_price = Column(Float, default=0.5)
+    creator_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
-    """
-    Создаём таблицы. Если БД недоступна (например, локально без postgres),
-    просто выводим предупреждение, но не роняем приложение.
-    """
     try:
         Base.metadata.create_all(bind=engine)
         print("[init_db] Database initialized")
