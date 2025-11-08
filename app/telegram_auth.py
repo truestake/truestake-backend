@@ -84,7 +84,6 @@ def auth_telegram():
             session.add(db_user)
 
         db_user.username = user.get("username")
-
         session.commit()
     except Exception as e:
         session.rollback()
@@ -111,5 +110,50 @@ def auth_telegram():
                 "username": user.get("username"),
             },
             "token": token,
+        }
+    )
+
+
+@bp.get("/me")
+def me():
+    """
+    Проверка токена.
+    Заголовок: Authorization: Bearer <jwt>
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"ok": False, "error": "no_token"}), 401
+
+    token = auth_header.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid_token"}), 401
+
+    user_id = payload.get("user_id") or payload.get("sub")
+    if not user_id:
+        return jsonify({"ok": False, "error": "invalid_token"}), 401
+
+    try:
+        user_id = int(user_id)
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid_token"}), 401
+
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(telegram_id=user_id).first()
+    finally:
+        session.close()
+
+    if not db_user:
+        return jsonify({"ok": False, "error": "user_not_found"}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "user": {
+                "id": db_user.telegram_id,
+                "username": db_user.username,
+            },
         }
     )
