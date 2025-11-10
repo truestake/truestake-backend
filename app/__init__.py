@@ -8,18 +8,13 @@ from .db import init_db
 
 app = Flask(__name__)
 
-# CORS для Mini App:
-# Разрешаем фронту (https://app.corsarinc.ru) ходить:
-# - в /auth/telegram (авторизация)
-# - в /auth/me       (проверка токена)
-# - во все /markets  (лента, создание, модерация)
+# CORS:
+#  - /auth/*  : мини-апп ходит за авторизацией и /auth/me
+#  - /markets : мини-апп получает список рынков
 CORS(
     app,
     resources={
-        r"/auth/telegram": {
-            "origins": ["https://app.corsarinc.ru"]
-        },
-        r"/auth/me": {
+        r"/auth/*": {
             "origins": ["https://app.corsarinc.ru"]
         },
         r"/markets*": {
@@ -28,14 +23,16 @@ CORS(
     },
 )
 
+
 @app.get("/")
 def root():
     return jsonify(status="ok", service="backend")
 
-# Регистрируем все блюпринты
+
+# Регистрируем блюпринты
 app.register_blueprint(ton_bp)
 app.register_blueprint(tg_auth_bp)
 app.register_blueprint(markets_bp)
 
-# Инициализация БД (создание таблиц, если нет)
+# Инициализация БД при старте
 init_db()
