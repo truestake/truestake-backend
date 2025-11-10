@@ -1,17 +1,25 @@
 import os
 from datetime import datetime
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 import jwt
 
 from app.db import SessionLocal, Market, User
 
-bp = Blueprint("markets", __name__, url_prefix="/markets")
+# Blueprint БЕЗ префикса, все пути указываем явно ниже
+bp = Blueprint("markets", __name__)
 
+# Секрет для проверки JWT (тот же, что в telegram_auth)
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
 
 
 def _get_current_user():
+    """
+    Достаём пользователя из заголовка Authorization: Bearer <token>.
+    Возвращаем (user, error):
+      - (User, None) если всё ок
+      - (None, "error_key") если ошибка
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None, "no_token"
@@ -43,18 +51,38 @@ def _get_current_user():
     return user, None
 
 
-@bp.get("")
+@bp.get("/markets")
 def list_markets():
     """
-    Лента событий для Mini App и бота.
-    Фильтры:
-      ?status=active|pending|...
-      ?category=politics|sport|...
+    Лента рынков для Mini App и бота.
+
+    Поддерживаемые query-параметры:
+      ?status=active|pending|resolved|...
+      ?category=politics|economy|crypto|...
       ?search=текст
+
+    Возвращаем JSON:
+      {
+        "ok": true,
+        "markets": [
+          {
+            "id": ...,
+            "question": "...",
+            "category": "...",
+            "status": "active",
+            "resolution_ts": "2026-12-31T23:59:59",
+            "prob_yes": 62.5,
+            "volume_usd": 348000.0,
+            "logo_url": "...",
+            "resolution_source": "..."
+          },
+          ...
+        ]
+      }
     """
-    status = request.args.get("status", "active")
-    category = request.args.get("category")
-    search = request.args.get("search")
+    status = request.args.get("status") or None
+    category = request.args.get("category") or None
+    search = request.args.get("search") or None
 
     db = SessionLocal()
     try:
@@ -62,8 +90,10 @@ def list_markets():
 
         if status:
             q = q.filter(Market.status == status)
-        if category:
+
+        if category and category != "all":
             q = q.filter(Market.category == category)
+
         if search:
             like = f"%{search}%"
             q = q.filter(Market.question.ilike(like))
@@ -78,108 +108,104 @@ def list_markets():
                     "question": m.question,
                     "category": m.category,
                     "status": m.status,
-                    "prob_yes": m.probability_yes,
-                    "volume_usd": m.volume_usd,
                     "resolution_ts": m.resolution_ts.isoformat()
                     if m.resolution_ts
                     else None,
+                    "prob_yes": m.probability_yes,
+                    "volume_usd": m.volume_usd,
+                    "logo_url": getattr(m, "logo_url", None),
+                    "resolution_source": getattr(m, "resolution_source", None),
                 }
             )
+    except Exception as e:
+        current_app.logger.exception("[list_markets][error] %s", e)
+        return jsonify(ok=False, error="db_error"), 500
     finally:
         db.close()
 
-    return jsonify({"ok": True, "markets": items})
+    return jsonify(ok=True, markets=items)
 
 
-@bp.post("")
+@bp.post("/markets")
 def create_market():
     """
-    Создание события.
-    Доступ: role=creator или role=admin.
-
-    Вход JSON:
-    {
-      "question": "U.S. National Debt exceeds $40T by Dec 31, 2026",
-      "category": "economy",
-      "resolution_ts": "2026-12-31T23:59:59"
-    }
+    Создание нового рынка.
+    Доступно только для ролей: creator, admin.
     """
     user, err = _get_current_user()
     if err:
-        return jsonify({"ok": False, "error": err}), 401
+        return jsonify(ok=False, error=err), 401
 
-    if user.role not in ("creator", "admin"):
-        return jsonify({"ok": False, "error": "forbidden"}), 403
+    role = (user.role or "user").lower()
+    if role not in ("creator", "admin"):
+        return jsonify(ok=False, error="forbidden"), 403
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(force=True) or {}
 
     question = (data.get("question") or "").strip()
-    category = (data.get("category") or "").strip() or None
-    resolution_ts_raw = (data.get("resolution_ts") or "").strip()
+    category = (data.get("category") or "other").strip()
+    resolution_ts_str = (data.get("resolution_ts") or "").strip()
+    logo_url = (data.get("logo_url") or "").strip() or None
+    resolution_source = (data.get("resolution_source") or "").strip() or None
 
     if not question:
-        return jsonify({"ok": False, "error": "question_required"}), 400
+        return jsonify(ok=False, error="question_required"), 400
 
     resolution_ts = None
-    if resolution_ts_raw:
+    if resolution_ts_str:
         try:
-            resolution_ts = datetime.fromisoformat(resolution_ts_raw)
-        except Exception:
-            return jsonify({"ok": False, "error": "bad_resolution_ts"}), 400
-
-    status = "active" if user.role == "admin" else "pending"
+            resolution_ts = datetime.fromisoformat(resolution_ts_str)
+        except ValueError:
+            return jsonify(ok=False, error="bad_resolution_ts"), 400
 
     db = SessionLocal()
     try:
         m = Market(
             question=question,
             category=category,
+            status="pending",
             resolution_ts=resolution_ts,
             creator_telegram_id=user.telegram_id,
-            status=status,
-            probability_yes=50.0,
-            volume_usd=0.0,
+            logo_url=logo_url,
+            resolution_source=resolution_source,
         )
         db.add(m)
         db.commit()
         db.refresh(m)
+
+        result = {
+            "id": m.id,
+            "status": m.status,
+            "question": m.question,
+            "category": m.category,
+        }
+        return jsonify(ok=True, market=result), 200
     except Exception as e:
         db.rollback()
-        print("[create_market][db_error]", repr(e), flush=True)
-        return jsonify({"ok": False, "error": "db_error"}), 500
+        current_app.logger.exception("[create_market][db_error] %s", e)
+        return jsonify(ok=False, error="db_error"), 500
     finally:
         db.close()
 
-    return jsonify(
-        {
-            "ok": True,
-            "market": {
-                "id": m.id,
-                "status": m.status,
-                "question": m.question,
-            },
-        }
-    )
 
-
-@bp.post("/activate/<int:market_id>")
+@bp.post("/markets/activate/<int:market_id>")
 def activate_market(market_id: int):
     """
-    Апрув события.
-    Доступ: role=admin.
+    Апрув/активация рынка.
+    Доступ: только admin.
     """
     user, err = _get_current_user()
     if err:
-        return jsonify({"ok": False, "error": err}), 401
+        return jsonify(ok=False, error=err), 401
 
-    if user.role != "admin":
-        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if (user.role or "").lower() != "admin":
+        return jsonify(ok=False, error="forbidden"), 403
 
     db = SessionLocal()
     try:
         m = db.query(Market).filter_by(id=market_id).first()
         if not m:
-            return jsonify({"ok": False, "error": "not_found"}), 404
+            return jsonify(ok=False, error="not_found"), 404
 
         m.status = "active"
         m.updated_at = datetime.utcnow()
@@ -187,9 +213,9 @@ def activate_market(market_id: int):
         db.refresh(m)
     except Exception as e:
         db.rollback()
-        print("[activate_market][db_error]", repr(e), flush=True)
-        return jsonify({"ok": False, "error": "db_error"}), 500
+        current_app.logger.exception("[activate_market][db_error] %s", e)
+        return jsonify(ok=False, error="db_error"), 500
     finally:
         db.close()
 
-    return jsonify({"ok": True, "market": {"id": m.id, "status": m.status}})
+    return jsonify(ok=True, market={"id": m.id, "status": m.status})
