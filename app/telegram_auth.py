@@ -1,64 +1,89 @@
 import os
+import time
 import hmac
 import hashlib
-import time
-import json
-import urllib.parse
-from datetime import datetime, timedelta
+from urllib.parse import parse_qs
 
 from flask import Blueprint, request, jsonify
 import jwt
 
-from app.db import SessionLocal, User
+from .db import SessionLocal, User
 
 bp = Blueprint("telegram_auth", __name__, url_prefix="/auth")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Токен бота и секрет для подписи JWT
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
+# TTL токена (по умолчанию 30 дней)
+JWT_TTL = int(os.getenv("JWT_TTL", "2592000"))
 
 
-def _validate_init_data(init_data: str, max_age: int = 600):
-    if not init_data or not BOT_TOKEN:
+# =========================
+# Вспомогательные функции
+# =========================
+
+def _build_jwt(user: User) -> str:
+    """
+    Собираем JWT для Mini App.
+    В payload кладём:
+      - sub / user_id = telegram_id
+    """
+    now = int(time.time())
+    payload = {
+        "sub": str(user.telegram_id),
+        "user_id": user.telegram_id,
+        "exp": now + JWT_TTL,
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    # В новых версиях jwt.encode возвращает str, в старых bytes
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+    return token
+
+
+def _verify_telegram_init_data(init_data: str) -> dict | None:
+    """
+    Проверка подписи initData от Telegram.
+
+    Возвращает dict с данными пользователя, если всё ок,
+    иначе None.
+    """
+    if not BOT_TOKEN:
         return None
 
-    parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
-    data = dict(parsed)
-
-    their_hash = data.pop("hash", None)
-    if not their_hash:
+    try:
+        # initData приходит в виде query-string
+        data = parse_qs(init_data, strict_parsing=True)
+    except Exception:
         return None
 
-    auth_date_raw = data.get("auth_date")
-    if auth_date_raw:
-        try:
-            auth_ts = int(auth_date_raw)
-            if int(time.time()) - auth_ts > max_age:
-                return None
-        except ValueError:
-            return None
+    if "hash" not in data:
+        return None
 
-    data_check_arr = [f"{k}={v}" for k, v in sorted(data.items())]
-    data_check_string = "\n".join(data_check_arr)
+    tg_hash = data.pop("hash")[0]
 
-    secret_key = hmac.new(
-        "WebAppData".encode(),
-        BOT_TOKEN.encode(),
-        hashlib.sha256,
-    ).digest()
+    # Подготовка строки по правилам Telegram:
+    # sort by key, join "key=value" через "\n"
+    pairs = []
+    for k in sorted(data.keys()):
+        v = data[k][0]
+        pairs.append(f"{k}={v}")
+    check_string = "\n".join(pairs)
 
-    expected_hash = hmac.new(
-        secret_key,
-        data_check_string.encode(),
-        hashlib.sha256,
+    secret_key = hashlib.sha256(BOT_TOKEN.encode("utf-8")).digest()
+    hmac_hash = hmac.new(
+        secret_key, check_string.encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(expected_hash, their_hash):
+    if hmac_hash != tg_hash:
         return None
 
-    user_raw = data.get("user")
+    # Извлекаем user из initData (поле "user" в JSON-строке)
+    user_raw = data.get("user", [None])[0]
     if not user_raw:
         return None
 
+    import json
     try:
         user = json.loads(user_raw)
     except Exception:
@@ -67,93 +92,123 @@ def _validate_init_data(init_data: str, max_age: int = 600):
     return user
 
 
-@bp.post("/telegram")
-def auth_telegram():
-    body = request.get_json(silent=True) or {}
-    init_data = body.get("init_data") or body.get("initData") or ""
-
-    user = _validate_init_data(init_data)
-    if not user:
-        return jsonify({"ok": False, "error": "invalid_init_data"}), 401
-
-    session = SessionLocal()
-    try:
-        db_user = session.query(User).filter_by(telegram_id=user["id"]).first()
-        if not db_user:
-            db_user = User(telegram_id=user["id"])
-            session.add(db_user)
-
-        db_user.username = user.get("username")
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print("[auth_telegram][db_error]", repr(e), flush=True)
-        return jsonify({"ok": False, "error": "db_error"}), 500
-    finally:
-        session.close()
-
-    token = jwt.encode(
-        {
-            "sub": str(user["id"]),
-            "user_id": user["id"],
-            "exp": datetime.utcnow() + timedelta(days=7),
-        },
-        JWT_SECRET,
-        algorithm="HS256",
-    )
-
-    return jsonify(
-        {
-            "ok": True,
-            "user": {
-                "id": user.get("id"),
-                "username": user.get("username"),
-            },
-            "token": token,
-        }
-    )
-
-
-@bp.get("/me")
-def me():
+def _get_user_from_jwt(auth_header: str):
     """
-    Проверка токена.
-    Заголовок: Authorization: Bearer <jwt>
+    Достаём пользователя из заголовка Authorization: Bearer <token>.
+    Возвращаем (user, error) — если error не None, значит ошибка.
     """
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"ok": False, "error": "no_token"}), 401
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None, "no_token"
 
     token = auth_header.split(" ", 1)[1].strip()
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except Exception:
-        return jsonify({"ok": False, "error": "invalid_token"}), 401
+        return None, "invalid_token"
 
-    user_id = payload.get("user_id") or payload.get("sub")
-    if not user_id:
-        return jsonify({"ok": False, "error": "invalid_token"}), 401
+    tg_id = payload.get("user_id") or payload.get("sub")
+    if not tg_id:
+        return None, "invalid_token"
 
     try:
-        user_id = int(user_id)
+        tg_id = int(tg_id)
     except ValueError:
-        return jsonify({"ok": False, "error": "invalid_token"}), 401
+        return None, "invalid_token"
 
-    session = SessionLocal()
+    db = SessionLocal()
     try:
-        db_user = session.query(User).filter_by(telegram_id=user_id).first()
+        user = db.query(User).filter_by(telegram_id=tg_id).first()
     finally:
-        session.close()
+        db.close()
 
-    if not db_user:
-        return jsonify({"ok": False, "error": "user_not_found"}), 404
+    if not user:
+        return None, "user_not_found"
+
+    return user, None
+
+
+# =========================
+# Эндпоинты
+# =========================
+
+@bp.post("/telegram")
+def auth_telegram():
+    """
+    Основной эндпоинт авторизации из Telegram Mini App.
+
+    Ожидает JSON:
+      { "initData": "<строка initData из Telegram.WebApp.initData>" }
+
+    1. Проверяем подпись initData.
+    2. Создаём/обновляем пользователя в БД.
+    3. Возвращаем JWT + user с ролью.
+    """
+    data = request.get_json(force=True) or {}
+    init_data = data.get("initData") or ""
+    user_data = _verify_telegram_init_data(init_data)
+    if not user_data:
+        return jsonify(ok=False, error="bad_init_data"), 400
+
+    tg_id = user_data.get("id")
+    username = user_data.get("username") or ""
+
+    if not tg_id:
+        return jsonify(ok=False, error="no_telegram_id"), 400
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(telegram_id=tg_id).first()
+        if not user:
+            # новый пользователь
+            user = User(
+                telegram_id=tg_id,
+                username=username,
+                role="user",  # по умолчанию обычный пользователь
+            )
+            db.add(user)
+        else:
+            # обновляем username если поменялся
+            if username and user.username != username:
+                user.username = username
+
+        db.commit()
+        db.refresh(user)
+    except Exception:
+        db.rollback()
+        return jsonify(ok=False, error="db_error"), 500
+    finally:
+        db.close()
+
+    token = _build_jwt(user)
 
     return jsonify(
-        {
-            "ok": True,
-            "user": {
-                "id": db_user.telegram_id,
-                "username": db_user.username,
-            },
-        }
+        ok=True,
+        token=token,
+        user={
+            "id": user.telegram_id,
+            "username": user.username,
+            "role": user.role or "user",
+        },
+    )
+
+
+@bp.get("/me")
+def auth_me():
+    """
+    Возвращает информацию о текущем пользователе по JWT.
+    Используется фронтом, чтобы понять роль (guest/creator/admin).
+    """
+    auth = request.headers.get("Authorization", "")
+    user, err = _get_user_from_jwt(auth)
+    if err:
+        # для фронта достаточно 401 + причина
+        return jsonify(ok=False, error=err), 401
+
+    return jsonify(
+        ok=True,
+        user={
+            "id": user.telegram_id,
+            "username": user.username,
+            "role": user.role or "user",
+        },
     )
